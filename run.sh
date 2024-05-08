@@ -1,4 +1,2 @@
-# Update this file to run your own code
-#!/bin/bash
+npm install secp256k1
 node output.js
-

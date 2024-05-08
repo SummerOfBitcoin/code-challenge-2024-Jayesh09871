@@ -1,662 +1,249 @@
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
-const secp256k1 = require("secp256k1");
+const { readFileSync, writeFileSync, appendFileSync } = require('fs');
+const crypto = require('crypto');
+const { serializeTransaction } = require("./utils/serializeTransaction");
+const { serializeWitnessTransaction } = require("./utils/serializeWitnessTransaction");
+const { findMerkleRoot } = require("./utils/findMerkleRoot");
+const { script_p2pkh, script_v0_p2wpkh } = require("./verification/script/script")
+const { HASH256 } = require("./op_codes/opcodes");
+const { verify_p2pkh, verify_v0_p2wpkh } = require('./verification/signatures/signature');
+const { serializeBlockHeader } = require("./utils/serializeBlockHeader");
+const { calculateWitnessCommitment } = require("./utils/calculateWitnessCommitment")
 
-const MEMPOOL_DIR = "mempool";
-const OUTPUT_FILE = "output.txt";
-const DIFFICULTY_TARGET =
-  "0000ffff00000000000000000000000000000000000000000000000000000000";
-const MAX_BLOCK_SIZE = 1_000_000; // 1 MB in bytes
-
-// Step 1: Read Transactions from Mempool
-const readTransactionsFromMempool = () => {
-  const transactions = fs
-    .readdirSync(MEMPOOL_DIR)
-    .map((file) =>
-      JSON.parse(fs.readFileSync(path.join(MEMPOOL_DIR, file), "utf8"))
-    );
-  return transactions;
-};
-
-// Step 2: Validate Transactions and Filter Valid Ones
-
-/**
- * Serialize transaction based on the input address type.
- * @param {Object} transaction - The transaction object.
- * @returns {Buffer} The serialized transaction.
- */
-function serializeTransaction(transaction) {
-  // console.log("transaction", transaction.vin[0].prevout, transaction);
-  let buffer = Buffer.alloc(0);
-  const serializeInput = (input) => {
-    const prevoutBuffer = Buffer.from(input.prevout.scriptpubkey, "hex");
-    const scriptSigBuffer = input.scriptsig
-      ? Buffer.from(input.scriptsig, "hex")
-      : Buffer.alloc(0);
-    const witnessBuffer = input.witness
-      ? Buffer.concat(input.witness.map((wit) => Buffer.from(wit, "hex")))
-      : Buffer.alloc(0);
-    return Buffer.concat([prevoutBuffer, scriptSigBuffer, witnessBuffer]);
-  };
-
-  const serializeOutput = (output) => {
-    const scriptPubKeyBuffer = Buffer.from(output.scriptpubkey, "hex");
-    let valueBuffer = Buffer.alloc(8);
-    valueBuffer.writeBigUInt64LE(BigInt(output.value));
-    return Buffer.concat([scriptPubKeyBuffer, valueBuffer]);
-  };
-  buffer = Buffer.concat([
-    buffer,
-    Buffer.from([
-      transaction.version >>> 24,
-      (transaction.version >>> 16) & 0xff,
-      (transaction.version >>> 8) & 0xff,
-      transaction.version & 0xff,
-    ]),
-    Buffer.from([transaction.vin.length]),
-  ]);
-
-  for (const input of transaction.vin) {
-    buffer = Buffer.concat([buffer, serializeInput(input)]);
-  }
-
-  buffer = Buffer.concat([buffer, Buffer.from([transaction.vout.length])]);
-
-  for (const output of transaction.vout) {
-    buffer = Buffer.concat([buffer, serializeOutput(output)]);
-  }
-
-  buffer = Buffer.concat([
-    buffer,
-    Buffer.from([
-      transaction.locktime >>> 24,
-      (transaction.locktime >>> 16) & 0xff,
-      (transaction.locktime >>> 8) & 0xff,
-      transaction.locktime & 0xff,
-    ]),
-  ]);
-
-  return buffer;
+class Transaction {
+    constructor(version, locktime, vin, vout) {
+        this.version = version;
+        this.locktime = locktime;
+        this.vin = vin;
+        this.vout = vout;
+    }
 }
 
-/**
- * Validate a transaction based on its input address type.
- * @param {Object} transaction - The transaction object.
- * @returns {boolean} True if the transaction is valid, false otherwise.
- */
-function validateTransaction(transaction) {
-  const validateP2PKH = (input) => {
-    // console.log("in validateP2PKH", input);
-    const scriptSig = Buffer.from(input.scriptsig, "hex");
-    const scriptPubKey = Buffer.from(input.prevout.scriptpubkey, "hex");
-    const tx = serializeTransaction(transaction);
-    const hash = crypto.createHash("sha256").update(tx).digest();
-
-    // Extracting signature and public key
-    const signatureLength = scriptSig.readUInt8(0);
-    const signatureEndIndex = 1 + signatureLength;
-    const signature = scriptSig.slice(1, signatureEndIndex);
-    // Extracting public key length
-    const publicKeyLength = scriptSig.readUInt8(signatureEndIndex);
-    const publicKeyEndIndex = signatureEndIndex + 1 + publicKeyLength;
-
-    // Extracting public key
-    const publicKey = scriptSig.slice(signatureEndIndex + 1, publicKeyEndIndex);
-    // console.log("in validateP2PKH public key", publicKeyLength, publicKey);
-    // Ensure publicKey is in the correct format (33 or 65 bytes)
-    if (publicKey.length !== 33 && publicKey.length !== 65) {
-      throw new Error("Invalid public key length");
+class Block {
+    constructor(prevBlockHash, merkleRoot) {
+        this.version = "20000000";
+        this.prevBlockHash = prevBlockHash;
+        this.merkleRoot = merkleRoot;
+        this.timestamp = Date.now() / 1000;
+        this.bits = "1f00ffff";
+        this.nonce = 0;
     }
 
-    // Prepare signature as two 32-byte values
-    const rValue = signature.slice(0, 32);
-    const sValue = signature.slice(32);
-    const signatureArray = new Uint8Array(64);
-    rValue.copy(signatureArray, 0);
-    sValue.copy(signatureArray, 32);
-
-    // Verify the signature
-    return secp256k1.ecdsaVerify(signatureArray, hash, publicKey);
-  };
-
-  const validateP2WPKH = (input) => {
-    const witness = input.witness;
-    const signatureBuffer = Buffer.from(witness[0], "hex");
-    const publicKey = Buffer.from(witness[1], "hex");
-    const scriptPubKey = Buffer.from(input.prevout.scriptpubkey, "hex");
-    const tx = serializeTransaction(transaction);
-
-    const txHash = crypto.createHash("sha256").update(tx).digest();
-    const hash = crypto.createHash("sha256").update(txHash).digest();
-
-    const signatureLength = signatureBuffer.length - 1;
-    const rValue = signatureBuffer.slice(0, 32);
-    const sValue = signatureBuffer.slice(32, 64);
-
-    const signature = new Uint8Array(64);
-    rValue.copy(signature, 0);
-    sValue.copy(signature, 32);
-
-    return secp256k1.ecdsaVerify(signature, hash, publicKey);
-  };
-
-  const validateP2SH = (input) => {
-    const redeemScript = Buffer.from(
-      input.inner_redeemscript_asm.split(" ").slice(1).join(""),
-      "hex"
-    );
-    const scriptSig = Buffer.from(
-      input.scriptsig_asm.split(" ").slice(1).join(""),
-      "hex"
-    );
-    const tx = serializeTransaction(transaction);
-    const hash = crypto.createHash("sha256").update(tx).digest();
-
-    // Execute the redeem script
-    const redeemScriptResult = executeScript(redeemScript, scriptSig, hash);
-
-    // Validate the redeem script result
-    if (!redeemScriptResult) {
-      console.error("P2SH validation failed: invalid redeem script execution");
-      return false;
+    hashBlock() {
+        const blockString = serializeBlockHeader(this.version, this.prevBlockHash, this.merkleRoot, this.timestamp, this.bits, this.nonce);
+        return Buffer.from(HASH256(blockString), "hex").reverse().toString("hex");
     }
 
-    return true;
-  };
-
-  const validateV0P2WSH = (input) => {
-    const witness = input.witness.map((item) => Buffer.from(item, "hex"));
-    const witnessScript = Buffer.from(
-      input.prevout.scriptpubkey_asm.split(" ").slice(1).join(""),
-      "hex"
-    );
-    const tx = serializeTransaction(transaction);
-    const hash = crypto.createHash("sha256").update(tx).digest();
-
-    // Execute the witness script
-    const witnessScriptResult = executeScript(witnessScript, witness, hash);
-
-    // Validate the witness script result
-    if (!witnessScriptResult) {
-      console.error(
-        "v0 P2WSH validation failed: invalid witness script execution"
-      );
-      return false;
-    }
-
-    return true;
-  };
-
-  const validateP2TR = (input) => {
-    //console.log("in validateP2TR", input);
-    const witness = input.witness;
-    const scriptPubKey = Buffer.from(input.prevout.scriptpubkey, "hex");
-    const tx = serializeTransaction(transaction);
-
-    const internalKey = witness[0];
-    const merkleRoot = witness[1];
-    const controlBlock = witness[2];
-
-    // Validate internal key, merkle root, and control block
-    // ...
-
-    const hashBuff = crypto.createHash("sha256").update(tx).digest();
-    const hashBigInt = BigInt(`0x${hashBuff.toString("hex")}`);
-
-    // Verify the signature using the internal key, merkle root, and control block
-    // ...
-
-    return true; // Return true if the signature is valid, false otherwise
-  };
-
-  const validateScriptPubKey = (input) => {
-    const scriptPubKey = Buffer.from(input.prevout.scriptpubkey_asm, "hex");
-    const ops = [];
-
-    for (let i = 0; i < scriptPubKey.length; i++) {
-      const opCode = scriptPubKey[i];
-
-      if (opCode >= 0x01 && opCode <= 0x4b) {
-        // Push data operation
-        const dataLength = opCode;
-        const data = scriptPubKey.slice(i + 1, i + 1 + dataLength);
-        ops.push({ op: "push", data: data.toString("hex") });
-        i += dataLength;
-      } else if (opCode >= 0x51 && opCode <= 0x60) {
-        // Push number operation
-        const num = opCode - 0x50;
-        ops.push({ op: "push", data: num.toString(16).padStart(2, "0") });
-      } else {
-        // Other operations
-        ops.push({ op: "code", code: opCode });
-      }
-    }
-
-    // Validate the script operations
-    // ...
-
-    return true; // Return true if the script is valid, false otherwise
-  };
-  const validateScriptSig = (input) => {
-    const scriptSig = input.scriptsig_asm
-      ? Buffer.from(input.scriptsig_asm, "hex")
-      : Buffer.alloc(0);
-    const ops = [];
-
-    for (let i = 0; i < scriptSig.length; i++) {
-      const opCode = scriptSig[i];
-
-      if (opCode >= 0x01 && opCode <= 0x4b) {
-        const dataLength = opCode;
-        const data = scriptSig.slice(i + 1, i + 1 + dataLength);
-        ops.push({ op: "push", data: data.toString("hex") });
-        i += dataLength;
-      } else if (opCode >= 0x51 && opCode <= 0x60) {
-        const num = opCode - 0x50;
-        ops.push({ op: "push", data: num.toString(16).padStart(2, "0") });
-      } else {
-        ops.push({ op: "code", code: opCode });
-      }
-    }
-
-    // Validate the script operations
-    // ...
-
-    return true;
-  };
-
-  const executeScript = (script, ...stackItems) => {
-    const stack = [];
-    let scriptIndex = 0;
-
-    const opcodes = {
-      OP_0: 0x00,
-      OP_PUSHDATA1: 0x4c,
-      OP_PUSHDATA2: 0x4d,
-      OP_PUSHDATA4: 0x4e,
-      OP_1NEGATE: 0x4f,
-      OP_1: 0x51,
-      OP_16: 0x60,
-      OP_CHECKSIG: 0xac,
-      OP_CHECKMULTISIG: 0xae,
-    };
-
-    const popStackItem = () => {
-      if (stack.length === 0) return undefined;
-      return stack.pop();
-    };
-
-    const pushStackItem = (item) => {
-      stack.push(item);
-    };
-
-    while (scriptIndex < script.length) {
-      const opcode = script[scriptIndex];
-
-      if (opcode in opcodes) {
-        switch (opcode) {
-          case opcodes.OP_0:
-            pushStackItem(Buffer.alloc(0));
-            break;
-          case opcodes.OP_PUSHDATA1:
-            const dataLength = script[scriptIndex + 1];
-            const data = script.slice(
-              scriptIndex + 2,
-              scriptIndex + 2 + dataLength
-            );
-            pushStackItem(data);
-            scriptIndex += dataLength;
-            break;
-          case opcodes.OP_PUSHDATA2:
-            // Handle OP_PUSHDATA2
-            break;
-          case opcodes.OP_PUSHDATA4:
-            // Handle OP_PUSHDATA4
-            break;
-          case opcodes.OP_1NEGATE:
-          case opcodes.OP_1:
-          case opcodes.OP_16:
-            const num = opcode - 0x50;
-            pushStackItem(Buffer.from([num]));
-            break;
-          case opcodes.OP_CHECKSIG:
-            // Handle OP_CHECKSIG
-            break;
-          case opcodes.OP_CHECKMULTISIG:
-            // Handle OP_CHECKMULTISIG
-            break;
-          // Add cases for other opcodes
+    mineBlock(difficulty) {
+        while (this.nonce < 4294967295) {
+            this.nonce++;
+            const hash = this.hashBlock();
+            for (let i = 0; i < hash.length; i++) {
+                if (hash[i] > difficulty[i]) {
+                    break;
+                }
+                if (hash[i] < difficulty[i]) {
+                    return;
+                }
+            }
         }
-      } else {
-        // Handle non-opcode bytes
-      }
-
-      scriptIndex++;
     }
 
-    // Return true if script execution is successful, false otherwise
-    return true;
-  };
-
-  for (const input of transaction.vin) {
-    const scriptPubKeyType = input.prevout.scriptpubkey_type;
-    switch (scriptPubKeyType) {
-      case "p2pkh":
-        if (input.scriptsig) {
-          if (!validateP2PKH(input)) {
-            return false;
-          }
-        } else {
-          if (!validateScriptSig(input)) {
-            return false;
-          }
-        }
-        break;
-      case "v0_p2wpkh":
-        if (input.witness && input.witness.length > 0) {
-          if (!validateP2WPKH(input)) {
-            return false;
-          }
-        } else {
-          if (!validateScriptSig(input)) {
-            return false;
-          }
-        }
-        break;
-      case "v1_p2tr":
-        if (!validateP2TR(input)) {
-          return false;
-        }
-        break;
-      case "p2sh":
-        if (!validateP2SH(input)) {
-          return false;
-        }
-        break;
-      case "v0_p2wsh":
-        if (!validateV0P2WSH(input)) {
-          return false;
-        }
-        break;
-      default:
-        console.warn(`Unsupported script type: ${scriptPubKeyType}`);
-        return false;
+    getBlockHeader() {
+        return serializeBlockHeader(this.version, this.prevBlockHash, this.merkleRoot, this.timestamp, this.bits, this.nonce)
     }
-    if (!validateScriptPubKey(input)) {
-      return false;
-    }
-  }
-
-  return true;
 }
 
-const getValidTransactions = (transactions) => {
-  return transactions.filter(validateTransaction);
-};
 
-// Step 3: Construct the Block
-const constructBlock = (validTransactions) => {
-  const coinbaseTransaction = {
-    version: 1,
-    locktime: 0,
-    vin: [
-      {
-        txid: "0000000000000000000000000000000000000000000000000000000000000000",
-        vout: 4294967295,
-        prevout: {
-          scriptpubkey: "0014cbbfcc021f4dbd0697f7e02eb1949a70be183375",
-          scriptpubkey_asm:
-            "OP_0 OP_PUSHBYTES_20 cbbfcc021f4dbd0697f7e02eb1949a70be183375",
-          scriptpubkey_type: "v0_p2wpkh",
-          scriptpubkey_address: "bc1qewlucqslfk7sd9lhuqhtr9y6wzlpsvm46wyugs",
-          value: 0,
-        },
-        scriptsig: "",
-        scriptsig_asm: "",
-        witness: [
-          "3044022079c55b9397f12c131e2f4618acae8c27c575c8e6b8547a46e706b4523280176802200f8f0fdefa78f62be8403952dea982642f52b9fded1b4e882f481815e1377b3701",
-          "0367a853d263f0b45548fcbdef9e63ee30ded60a3f3ac86462d4d3f49b22298e60",
-        ],
-        is_coinbase: true,
-        sequence: 4294967295,
-      },
+// Parse transaction JSON files
+function parseTransactionFile(filename) {
+    const { version, locktime, vin, vout } = filename;
+    return new Transaction(version, locktime, vin, vout);
+}
+
+
+function getTxid(serializedTransaction) {
+
+    // Double SHA256 hash
+    const txid = HASH256(serializedTransaction)
+
+    return txid;
+}
+
+function getWTxid(serializedTransaction) {
+
+    // Double SHA256 hash
+    const txid = HASH256(serializedTransaction)
+
+    return txid;
+}
+
+const txn = {
+    "version": 1,
+    "locktime": 0,
+    "vin": [
+        {
+            "txid": "f615c0412f959c0b3813cbd232bbb1c1a8ad656c37fb60b601f633a6d2d76942",
+            "vout": 20,
+            "prevout": {
+                "scriptpubkey": "0014df4bf9f3621073202be59ae590f55f42879a21a0",
+                "scriptpubkey_asm": "OP_0 OP_PUSHBYTES_20 df4bf9f3621073202be59ae590f55f42879a21a0",
+                "scriptpubkey_type": "v0_p2wpkh",
+                "scriptpubkey_address": "bc1qma9lnumzzpejq2l9ntjepa2lg2re5gdqn3nf0c",
+                "value": 175902
+            },
+            "scriptsig": "",
+            "scriptsig_asm": "",
+            "witness": [
+                "3045022100a2a839100b7ca7dc97ca8234de56caabc5d30bf5ce561aa61ac1925d9ed09ed60220625b88cc6ddc0715c178fb57fd1ffb65ee905de7670595f2dea9c5feeb6b40d401",
+                "03cbf0481cd6ca805552d024e051f1f73086a2abebecdec8bc793d5ef87ec1a2f6"
+            ],
+            "is_coinbase": false,
+            "sequence": 4294967295
+        }
     ],
-    vout: [
-      {
-        scriptpubkey: "a91420756d2dd9f0cc05fe200794251642ff9e76008587",
-        scriptpubkey_asm:
-          "OP_HASH160 OP_PUSHBYTES_20 20756d2dd9f0cc05fe200794251642ff9e760085 OP_EQUAL",
-        scriptpubkey_type: "p2sh",
-        scriptpubkey_address: "34eeDckhVvGkbnTzGx6qbz2AkmyV9syc8R",
-        value: 50000000,
-      },
-    ],
-  };
+    "vout": [
+        {
+            "scriptpubkey": "a914626b93cce10ebd0d4d876487f602272c01e39e2387",
+            "scriptpubkey_asm": "OP_HASH160 OP_PUSHBYTES_20 626b93cce10ebd0d4d876487f602272c01e39e23 OP_EQUAL",
+            "scriptpubkey_type": "p2sh",
+            "scriptpubkey_address": "3AfR1wwfaaftqLfv2pAa9ebEXG43uZ9cdn",
+            "value": 172905
+        }
+    ]
+}
 
-  // Sort valid transactions based on fees
-  const sortedTransactions = validTransactions.sort((a, b) => {
-    const aFee =
-      a.vout.reduce((acc, output) => acc + output.value, 0) -
-      a.vin.reduce((acc, input) => acc + input.prevout.value, 0);
-    const bFee =
-      b.vout.reduce((acc, output) => acc + output.value, 0) -
-      b.vin.reduce((acc, input) => acc + input.prevout.value, 0);
-    return bFee - aFee;
-  });
+// Validate transactions
+let validTxids = [];
+let validWTxids = ['0000000000000000000000000000000000000000000000000000000000000000']
+function validateTransactions(transactions) {
+    let ct = 0;
+    // Simulated validation, assuming all transactions are valid
+    // console.log(txn)
+    // const txid = getTxid(txn);
+    // console.log("txid:", txid);
+    // console.log("file:", Buffer.from(crypto.createHash('sha256').update(txid, "hex").digest()).toString("hex"));
+    // console.log((crypto.createHash('sha256').update(getTxid(transactions[0]), "hex").digest()))
+    for (let transaction of transactions) {
+        // for coinbase transaction
 
-  // Construct the block with the sorted transactions
-  let blockSize = serializeTransaction(coinbaseTransaction).length;
-  const blockTransactions = [coinbaseTransaction];
+        // OP_HASH(transaction);
+        let flg = true;
+        // if(transaction.vin[0].prevout.scriptpubkey_type === "p2sh"){
+        //     console.log(transaction.vin[0].txid);
+        // }
 
-  for (const tx of sortedTransactions) {
-    const txSize = serializeTransaction(tx).length;
-    if (blockSize + txSize > MAX_BLOCK_SIZE) {
-      break;
+        // ***CHECK INPUT SUM IS GREATER THAN OUTPUT SUM***
+        let inputSum = 0, outputSum = 0;
+        transaction.vin.map((input) => {
+            inputSum += input.prevout.value;
+        })
+        transaction.vout.map((output) => {
+            outputSum += output.value;
+        })
+        // if below condition holds, txn is invalid
+        if (inputSum <= outputSum) {
+            flg = false;
+            delete transactions.transaction;
+        }
+        //  *** check pubkey script validation ***
+        if (flg) {
+            flg = false;
+            for (let vin of transaction.vin) {
+                if (vin.prevout.scriptpubkey_type === "v1_p2tr") {
+                    flg = true;
+                }
+                if (vin.prevout.scriptpubkey_type === "v0_p2wpkh") {
+                    flg = true
+                    if (!script_v0_p2wpkh(vin) || !verify_v0_p2wpkh(transaction, vin)) {
+                        flg = false;
+                        break;
+                    }
+                }
+                if (vin.prevout.scriptpubkey_type === "p2pkh") {
+                    flg = true;
+                    // pubkey script validation
+                    if (!script_p2pkh(vin) || !verify_p2pkh(transaction, vin)) {
+                        flg = false;
+                        break;
+                    }
+                }
+            }
+            if (flg) {
+                ct++;
+                // console.log(transaction);
+                // getTxid(transaction);
+                // Serialize transaction
+                const serializedTransaction = serializeTransaction(txn)
+                const serializedWitnessTransaction = serializeWitnessTransaction(txn)
+                // console.log(serializedTransaction)
+                // console.log(getTxid(serializedTransaction))
+                validTxids.push(getTxid(serializedTransaction));
+                validWTxids.push(getWTxid(serializedWitnessTransaction));
+            }
+        }
     }
-    // console.log("the  transaction that is being added to be mined", tx);
-    blockTransactions.push(tx);
-    blockSize += txSize;
-  }
+    console.log(ct)
+}
 
-  return blockTransactions;
-};
+// Create block
+function createBlock(transactions, prevBlockHash, difficulty, merkleRoot) {
+    return new Block(transactions, prevBlockHash, difficulty, merkleRoot);
+}
 
-// Step 4: Mine the Block
-const mineBlock = (blockTransactions) => {
-  const version = 4;
-  const previousBlockHash =
-    "0000000000000000000000000000000000000000000000000000000000000000";
-  const merkleRoot = calculateMerkleRoot(blockTransactions);
-  const difficultyTarget =
-    "0000ffff00000000000000000000000000000000000000000000000000000000";
-  let nonce = 0;
-  let timestamp = Math.floor(Date.now() / 1000);
-  let blockHeader = "";
-  const bits = "1f00ffff"; // Compact representation of the difficulty target
+// importing transaction files and adding them into transactionFiles object;
+var transactionFiles = [];
+var normalizedPath = require("path").join(__dirname, "mempool");
 
-  // Construct the block header template
-  const blockHeaderTemplate = Buffer.alloc(80);
-  blockHeaderTemplate.writeUInt32LE(version, 0);
-  Buffer.from(previousBlockHash, "hex").reverse().copy(blockHeaderTemplate, 4);
-  Buffer.from(merkleRoot, "hex").reverse().copy(blockHeaderTemplate, 36);
-  blockHeaderTemplate.writeUInt32LE(timestamp, 68);
 
-  // Reverse the byte order of the difficulty target
-  const reversedBits = Buffer.from(bits, "hex").reverse().toString("hex");
-  blockHeaderTemplate.write(reversedBits, 72, 4, "hex");
+require("fs").readdirSync(normalizedPath).forEach(function (file) {
+    const curFile = require("./mempool/" + file);
+    transactionFiles.push(curFile);
+});
+// console.log(transactionFiles);
+const transactions = transactionFiles.map(parseTransactionFile);
+// console.log(transactions)
 
-  // Calculate the target value from the difficulty target
-  const targetValue = BigInt("0x" + difficultyTarget);
+validateTransactions(transactions);
 
-  // Define the mining interval and maximum nonce value
-  const miningInterval = 100000;
-  const maxNonce = 0xffffffff;
+const witnessCommitment = calculateWitnessCommitment(validWTxids)
 
-  while (true) {
-    // Update the timestamp
-    timestamp = Math.floor(Date.now() / 1000);
-    blockHeaderTemplate.writeUInt32LE(timestamp, 68);
+const serializedCoinbaseTransaction = `010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff2503233708184d696e656420627920416e74506f6f6c373946205b8160a4256c0000946e0100ffffffff02f595814a000000001976a914edf10a7fac6b32e24daa5305c723f3de58db1bc888ac0000000000000000266a24aa21a9ed${witnessCommitment}0120000000000000000000000000000000000000000000000000000000000000000000000000`
 
-    // Iterate over a range of nonce values
-    for (let i = 0; i < miningInterval; i++) {
-      // Update the nonce in the block header template
-      blockHeaderTemplate.writeUInt32LE(nonce, 76);
+const coinbaseTxid = getTxid(serializedCoinbaseTransaction);
 
-      // Calculate the double SHA-256 hash of the block header
-      const hash = crypto
-        .createHash("sha256")
-        .update(
-          crypto.createHash("sha256").update(blockHeaderTemplate).digest()
-        )
-        .digest();
+validTxids.unshift(coinbaseTxid)
+// Testing
+const prevBlockHash = "0000000000000000000000000000000000000000000000000000000000000000";
+const difficulty = "0000ffff00000000000000000000000000000000000000000000000000000000";
 
-      // Reverse the hash before converting to BigInt
-      const reversedHash = hash
-        .toString("hex")
-        .match(/.{2}/g)
-        .reverse()
-        .join("");
 
-      // Convert the reversed hash to a BigInt for comparison
-      const hashValue = BigInt("0x" + reversedHash);
-      // console.log("mining", hashValue, targetValue);
-      // Check if the hash value is less than the target value
-      if (hashValue < targetValue) {
-        blockHeader = blockHeaderTemplate.toString("hex");
-        return { blockHeader, blockTransactions };
-      }
 
-      // Increment the nonce
-      nonce++;
 
-      // Check if the maximum nonce value is reached
-      if (nonce > maxNonce) {
-        nonce = 0;
-        break;
-      }
-    }
-  }
-};
 
-const hash256 = (input) => {
-  const h1 = crypto
-    .createHash("sha256")
-    .update(Buffer.from(input, "hex"))
-    .digest();
-  return crypto.createHash("sha256").update(h1).digest("hex");
-};
+// Mine block
+function mineBlock(transactions, prevBlockHash, difficulty) {
+    const merkleRoot = findMerkleRoot(validTxids);
+    const block = createBlock(prevBlockHash, merkleRoot);
+    const minedBlockHash = block.mineBlock(difficulty);
+    return { minedBlockHash, block };
+}
 
-// const calculateMerkleRoot = (transactions) => {
-//   if (transactions.length === 0) {
-//     return "0000000000000000000000000000000000000000000000000000000000000000";
-//   }
+// Write block and transactions to output.txt
+function writeToOutput(blockHeader, serializedCoinbaseTransaction, transactions) {
+    writeFileSync('output.txt', blockHeader + '\n');
+    appendFileSync('output.txt', serializedCoinbaseTransaction + '\n');
 
-//   let level = transactions.reduce((txids, tx) => {
-//     tx.vin.forEach((input) => {
-//       txids.push(input.txid);
-//     });
-
-//     return txids;
-//   }, []);
-
-//   while (level.length > 1) {
-//     const nextLevel = [];
-
-//     for (let i = 0; i < level.length; i += 2) {
-//       let pairHash;
-//       if (i + 1 === level.length) {
-//         // In case of an odd number of elements, duplicate the last one
-//         pairHash = hash256(level[i] + level[i]);
-//       } else {
-//         pairHash = hash256(level[i] + level[i + 1]);
-//       }
-//       nextLevel.push(pairHash);
-//     }
-
-//     level = nextLevel;
-//   }
-
-//   console.log("merkle hashing done", level[0]);
-
-//   return level[0];
-
-//   // return Buffer.from(level[0]).reverse().toString("hex");
-// };
-
-const calculateMerkleRoot = (transactions) => {
-  if (transactions.length === 0) {
-    return "0000000000000000000000000000000000000000000000000000000000000000";
-  }
-
-  let hashes = transactions.reduce((txids, tx) => {
-    tx.vin.forEach((input) => {
-      txids.push(Buffer.from(input.txid, "hex").reverse());
+    transactions.forEach(tx => {
+        // reverse byte order
+        tx = Buffer.from(tx, "hex").reverse().toString("hex");
+        appendFileSync('output.txt', tx + '\n');
     });
-    return txids;
-  }, []);
+}
 
-  while (hashes.length > 1) {
-    const newHashes = [];
-    for (let i = 0; i < hashes.length; i += 2) {
-      const hash1 = hashes[i];
-      let hash2;
-      if (i + 1 < hashes.length) {
-        hash2 = hashes[i + 1];
-      } else {
-        // If there's an odd number of hashes, duplicate the last hash
-        hash2 = hash1;
-      }
-      const combinedHash = crypto
-        .createHash("sha256")
-        .update(
-          crypto
-            .createHash("sha256")
-            .update(Buffer.concat([hash1, hash2]))
-            .digest()
-        )
-        .digest();
-      newHashes.push(combinedHash);
-    }
-    hashes = newHashes;
-  }
+// Mine block
+const { minedBlockHash, block } = mineBlock(transactionFiles, prevBlockHash, difficulty);
 
-  return Buffer.from(hashes[0]).reverse().toString("hex");
-};
-// Main function
-const main = () => {
-  const transactions = readTransactionsFromMempool();
-  const validTransactions = getValidTransactions(transactions);
-
-  const blockTransactions = constructBlock(validTransactions);
-  const { blockHeader, blockTransactions: minedTransactions } =
-    mineBlock(blockTransactions);
-
-  const serializedCoinbaseTransaction = serializeTransaction(
-    minedTransactions[0]
-  ).toString("hex");
-  const txids = minedTransactions.map((tx) =>
-    crypto.createHash("sha256").update(serializeTransaction(tx)).digest("hex")
-  );
-
-  const txids2 = minedTransactions.reduce((txids, tx) => {
-    tx.vin.forEach((input) => {
-      txids.push(input.txid);
-    });
-
-    return txids;
-  }, []);
-
-  const output = `${blockHeader}\n${serializedCoinbaseTransaction}\n${txids2.join(
-    "\n"
-  )}`;
-  fs.writeFileSync(OUTPUT_FILE, output);
-  console.log(
-    "length",
-    blockHeader,
-    transactions.length,
-    validTransactions.length
-  );
-};
-
-main();
+// Write to output.txt
+writeToOutput(block.getBlockHeader(), serializedCoinbaseTransaction, validTxids);
+// console.log(`Mined block hash: ${minedBlockHash}`);
+// console.log('Block and transactions written to output.txt');

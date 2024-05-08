@@ -11,6 +11,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "secp256k1": "^5.0.0"
+    "bitcoinjs-lib": "^6.1.5",
+    "secp256k1": "^5.0.0",
+    "uint8array-tools": "^0.0.7"
   }
 }
